@@ -1,0 +1,991 @@
+//				DEPOSITION SORT
+//
+// Author: Stew Forster (stew675@gmail.com)	Copyright (C) 2021-2025
+//
+// This is my implementation of what I believe to be an O(nlogn) in-place
+// adaptive merge-sort style algorithm.
+//
+// There is (almost) nothing new under the sun, and this is certainly an
+// evolution of the work of many others.  It has its roots in the following:
+//
+// - Merge Sort
+// - Insertion Sort
+// - Block Sort
+// - Grail Sort
+// - Powermerge - https://koreascience.kr/article/CFKO200311922203087.pdf
+//
+// This originally started out with me experimenting with sorting algorithms,
+// and I thought that I had stumbled onto something new, but all I'd done was
+// independently rediscover Powermerge (see link above)
+//
+// Here's a link to a StackOverflow answer I gave many years back some time
+// after I'd found my version of the solution:
+// https://stackoverflow.com/a/68603446/16534062
+//
+// Still, Powermerge has a number of glaring flaws, which I suspect is why
+// it hasn't been widely adopted, and the world has more or less coalesced
+// around Block Sort and its variants like GrailSort, and so on.  Its biggest
+// issue is that recursion stack depth is unbounded, and it's rather easy to
+// construct degenerate scenarios where the call stack will overflow in short
+// order.
+//
+// I worked to solve those issues, but the code grew in complexity, and then
+// started to slow down to point of losing all its benefits.  While messing
+// about with solutions, I created what I call SplitMergeInPlace().  To date
+// I've not found an algorithm that implements exactly what it does, but it
+// does have a number of strong similarities to what BlockSort does.
+//
+// Unlike DepositionMerge(), SplitMerge() doesn't bury itself in the details of
+// finding the precise optimal place to split a block being merged, but rather
+// uses a simple division algorithm to choose where to split.  In essence it
+// takes a "divide and conquer" approach to the problem of merging two arrays
+// together in place, and deposits fixed sized chunks, saves where that chunk
+// is on a work stack, and then continues depositing chunks.  When all chunks
+// are placed, it goes back and splits each one up again in turn into smaller
+// chunks, and continues.
+//
+// In doing so, it achieves a stack requirement of 16*log16(N) split points,
+// where N is the size of the left side array being merged.  The size of the
+// right-side array doesn't matter to the SplitMerge algorithm.  This stack
+// growth is very slow.  A stack size of 160 can account for over 10^12 items,
+// and a stack size of 240 can track over 10^18 items.
+//
+// SplitMerge() is about 30% slower than DepositionMerge() in practise though,
+// but it makes for an excellent fallback to the faster DepositionMerge()
+// algorithm for when DepositionMerge() gets lost in the weeds of chopping up
+// chunks and runs its work stack out of memory.
+//
+// I then read about how GrailSort and BlockSort use unique items as a work
+// space, which is what allows those algorithms to achieve sort stability.  I
+// didn't look too deeply into how either of those algorithms extract unique
+// items, preferring the challenge of coming up with my own solution to that
+// problem.  extract_uniques() is my solution that also takes a divide and
+// conquer approach to split an array of items into uniques and duplicates,
+// and then uses a variant of the Gries-Mills Block Swap algorithm to quickly
+// move runs of duplicates into place:
+//
+// Ref: https://en.wikipedia.org/wiki/Block_swap_algorithms
+//
+// extract_uniques() moves all duplicates, which are kept in sorted order, to
+// the left side of the main array, which creates a sorted block that can be
+// merged in at the end.  When enough unique items are gathered, they are then
+// used as the scratch work-space to invoke the adaptive merge sort in place
+// algorithm to efficiently sort that which remains.
+
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <assert.h>
+#include <stdbool.h>
+#include <errno.h>
+#include <limits.h>
+
+//				TUNING KNOBS!
+//
+// INSERT_SORT_MAX defines the number of items below which we'll resort to
+// simply using Insertion Sort.  Anything from 8-30 seems reasonable, with
+// values around 20+ giving best speeds at the expense of more swaps/compares
+#define	INSERT_SORT_MAX		24
+
+// For split_merge_in_place() its stack size needs to be 16 * log16(N) in size
+// where N is the number of items in the block being merged.  1 work stack
+// position holds 2 pointers (16 bytes on 64-bit machines),
+// 80 covers 10^6 items. 160 covers 10^12 items.  240 is 10^18
+#define	SPLIT_STACK_SIZE	160
+
+// For deposition_merge_in_place(), 1 work stack position holds 3 pointers (24
+// bytes on 64-bit machines). A stack size of 80 requires a hair under 4K on
+// the call stack.  I choose 160 (~8K) as this appears to cover all but the
+// most degenerate of scenarios up to 10^12 items.  It will always fall back
+// to the memory bounded split_merge_in_place() algorithm though as needed.
+// If stack is super tight, this can be dropped to 40 without issue.  If
+// stack memory is even tighter, just use split_merge_in_place() instead.
+#define	DEPOSIT_STACK_SIZE	160
+
+// SKEW defines the split ratio when doing top-down division of the array
+// A SKEW of 2 is classic merge sort, which would be better for larger element
+// sizes, or for low available stack memory deployments.
+// A SKEW of 4 appears to be cache optimal for smaller (<16 bytes) element
+// sizes SKEW values higher than 5 appear to degrade performance regardless
+#define	SKEW			4
+
+// WSRATIO defines the split ratio when choosing how much of the array to
+// use as a makeshift workspace when no workspace is provided
+// Experimentally anything from 3-20 works okay, but 9 appears optimal
+// Using 3 would mirror a closest approximation of classic merge sort
+#define	WSRATIO			9
+
+// STABLE_WSRATIO controls the behaviour of the stable sorting "front end" to
+// the main algorithm.  It has to dig out unique values from the sort space
+// to use as a workspace for the main algorithm.  Since doing so isn't "free"
+// there's a trade-off between spending more time digging out uniques, as
+// opposed to just using what we can find.  A good value appears to be anywhere
+// from 1.5x to 3x of what WSRATIO is set to,
+#define	STABLE_WSRATIO		19
+
+// WSTRIES is the number of attempts that the stable_sort() front-end will try
+// to achieve a suitably sized workspace to pass to the in-place merge sort.
+// The optimal value for this appears to be CPU architecture dependent, but
+// anywhere from 15-20 appears suitable
+#define	WSTRIES			18
+// Set the following to 1 to enable low-stack mode, whereby we will not use
+// deposition_merge_in_place(), and ONLY use split_merge_in_place algorithm.  This
+// will also use the bottom up merge implementation.  An average this is about
+// a 4% speed penalty, which admittedly isn't a whole lot
+#define	LOW_STACK	0
+
+// Sparingly used to guide compiling optimization
+#define likely(x)	__builtin_expect(!!(x), 1)
+#define unlikely(x)	__builtin_expect(!!(x), 0)
+
+// Handy defines to keep code looking cleaner
+#define	COMMON_ARGS	es, swaptype, is_lt
+#define	COMMON_PARAMS	const size_t es, int swaptype, const int (*is_lt)(const void *, const void *)
+
+//_____________________________________________________________________________
+// Swap-specific functions. These are a lightly modified version of this code:
+// https://elixir.bootlin.com/glibc/glibc-2.40.9000/source/stdlib/qsort.c
+
+enum swap_type_t {
+	SWAP_WORDS_64 = 0,
+	SWAP_WORDS_32,
+	SWAP_BYTES
+};
+
+static inline void
+memswap(void * restrict p1, void * restrict p2, size_t n)
+{
+	enum { SWAP_GENERIC_SIZE = 32 };
+
+	unsigned char tmp[SWAP_GENERIC_SIZE];
+
+	while (n > SWAP_GENERIC_SIZE) {
+		mempcpy(tmp, p1, SWAP_GENERIC_SIZE);
+		p1 = __mempcpy(p1, p2, SWAP_GENERIC_SIZE);
+		p2 = __mempcpy(p2, tmp, SWAP_GENERIC_SIZE);
+		n -= SWAP_GENERIC_SIZE;
+	}
+	while (n > 0) {
+		unsigned char t = ((unsigned char *)p1)[--n];
+		((unsigned char *)p1)[n] = ((unsigned char *)p2)[n];
+		((unsigned char *)p2)[n] = t;
+	}
+} // memswap
+
+#define	swap(a, b)					\
+	if (swaptype == SWAP_WORDS_32) {		\
+		uint32_t t = *(uint32_t *)(a);		\
+		*(uint32_t *)(a) = *(uint32_t *)(b);	\
+		*(uint32_t *)(b) = t;			\
+	} else if (swaptype == SWAP_WORDS_64) {		\
+		uint64_t t = *(uint64_t *)(a);		\
+		*(uint64_t *)(a) = *(uint64_t *)(b);	\
+		*(uint64_t *)(b) = t;			\
+	} else {					\
+		memswap ((a), (b), es);			\
+	}
+
+static enum swap_type_t
+get_swap_type (void *const pbase, size_t size)
+{
+	if (((size & (sizeof (uint32_t) - 1)) == 0) &&
+	    ((uintptr_t) pbase) % __alignof__ (uint32_t) == 0) {
+		if (size == sizeof (uint32_t)) {
+			return SWAP_WORDS_32;
+		} else if (size == sizeof (uint64_t) &&
+			 ((uintptr_t) pbase) % __alignof__ (uint64_t) == 0) {
+			return SWAP_WORDS_64;
+		}
+	}
+	return SWAP_BYTES;
+} // get_swap_type
+
+//_____________________________________________________________________________
+
+
+// Swaps two contiguous blocks of identical lengths in place efficiently
+// Takes advantage of any vectorization via the optimized memcpy library functions
+#define	SWAP_BLOCK_MIN		256
+static void
+swap_blk(char *a, char *b, size_t n)
+{
+	_Alignas(64) char t[1024];
+
+	do {
+		size_t	tc = n > 1024 ? 1024 : n;
+		memcpy(t, a, tc);
+		memcpy(a, b, tc);
+		memcpy(b, t, tc);
+		a+=tc;
+		b+=tc;
+		n-=tc;
+	} while (n > 0);
+} // swap_blk
+
+
+// Swaps two contiguous blocks of differing lengths in place efficiently
+// Basically my version of the well known block Rotate() functionality
+// that avoids the use of explicit, or implicit, division or multiplication
+static void
+_swab(char *a, char *b, char *e, COMMON_PARAMS)
+{
+	size_t	gapa = b - a, gapb = e - b;
+
+	while (gapa && gapb) {
+		if (gapa < gapb) {
+			for (char *src = a, *dst = a + gapb; dst != e; src += es, dst += es)
+				swap(src, dst);
+			e -= gapa;
+			gapb = e - b;
+		} else {
+			for (char *src = b, *dst = a; src != e; src += es, dst += es)
+				swap(src, dst);
+			a += gapb;
+			gapa = b - a;
+		}
+	}
+} // _swab
+
+
+// Implementation of standard insertion sort
+static void
+insertion_sort(char *pa, const size_t n, COMMON_PARAMS)
+{
+	char	*pe = pa + n * es, *ta, *tb;
+
+	for (ta = pa + es; ta != pe; ta += es)
+		for (tb = ta; tb != pa && is_lt(tb, tb - es); tb -= es)
+			swap(tb, tb - es);
+} // insertion_sort
+
+
+// This in-place merge algorithm started off life as a variant of DepositionMerge
+// below, but I was looking for a way to solve the multiple degenerate scenarios
+// where unbounded stack recursion could occur.  In the end, I couldn't fully
+// solve some of those without making the code complex and branch inefficient
+// and so split_merge_in_place() was born
+static void
+split_merge_in_place(char *pa, char *pb, char *pe, COMMON_PARAMS)
+{
+// The following #define is where the 16*log16(N) stack growth comes from
+#define	SPLIT_SIZE		(((((pb - pa) / es) + 15) >> 4) * es)
+
+	_Alignas(64) char *_stack[SPLIT_STACK_SIZE * 2];
+	char	**stack = _stack, *rp, *spa;
+	size_t	split_size, bs;
+
+	// For whoever calls us, check if we need to do anything at all
+	if (!is_lt(pb, pb - es))
+		goto split_pop;
+
+	// Determine our initial split size.  Ensure a minimum of 1 element
+	split_size = SPLIT_SIZE;
+
+split_again:
+	bs = pb - pa;		// Determine the byte-wise size of A
+
+	// Just insert merge single items. We already know that *PB < *PA
+	if (bs == es) {
+		do {
+			swap(pa, pb);  pa = pb;  pb += es;
+		} while ((pb != pe) && is_lt(pb, pa));
+		goto split_pop;
+	}
+
+	// Advance the PA->PB block up as far as we can
+	for (rp = pb + bs; (rp < pe) && is_lt(rp - es, pa); rp += bs)
+		if (bs < SWAP_BLOCK_MIN) {
+			for ( ; pb < rp; pa += es, pb += es)
+				swap(pa, pb);
+		} else {
+			swap_blk(pa, pb, bs);
+			pa = pb;     pb = rp;
+		}
+
+	// Split the A block into two, and keep trying with remainder
+	// The imbalanced split here improves algorithmic performance.
+	rp = pb - es;  spa = pa + split_size;
+	if (is_lt(pb, rp)) {
+		// Keep our split point within limits
+		spa = (spa > rp) ? rp : spa;
+
+		// Push a new split point to the work stack
+		*stack++ = pa;
+		*stack++ = spa;
+
+		pa = spa;
+		goto split_again;
+	}
+
+split_pop:
+	while (stack != _stack) {
+		pb = *--stack;
+		pa = *--stack;
+
+		if (is_lt(pb, pb - es)) {
+			split_size = SPLIT_SIZE;
+			goto split_again;
+		}
+	}
+#undef	SPLIT_SIZE
+} // split_merge_in_place
+
+
+#if (LOW_STACK == 0)
+// Merge two sorted sub-arrays together using insertion sort
+static void
+insertion_merge_in_place(char * restrict pa, char * restrict pb,
+			 char * restrict pe, COMMON_PARAMS)
+{
+	char	*tb = pe;
+
+	do {
+		pe = tb - es;  tb = pb - es;  pb = tb;
+		do {
+			swap(tb + es, tb);
+			tb = tb + es;
+		} while ((tb != pe) && is_lt(tb + es, tb));
+	} while ((pb != pa) && is_lt(pb, pb - es));
+} // insertion_merge_in_place
+
+
+// This is what everything is based on, and I call it DepositionMerge
+//
+// At its heart, the following algorithm is a variation on PowerMerge that
+// solves a number of PowerMerge's glaring issues with unbounded stack
+// recursion, and other inefficiencies inherent to the base algorithm.
+//
+// This is implemented as an iterative function that uses a work stack to
+// note the location of split points to be revisited later to merge in.
+//
+// Assumes NA and NB are greater than zero
+static void
+deposition_merge_in_place(char *pa, char *pb, char *pe, COMMON_PARAMS)
+{
+#define	DEPOSIT_STACK_PUSH(s1, s2, s3) 	\
+	{ *stack++ = s1; *stack++ = s2; *stack++ = s3; }
+
+#define	DEPOSIT_STACK_POP(s1, s2, s3) \
+	{ s3 = *--stack; s2 = *--stack; s1 = *--stack; }
+
+	_Alignas(64) char *_stack[DEPOSIT_STACK_SIZE * 3];
+	char	**maxstack, **stack = _stack;
+	char	*rp, *sp;	// Deposition-Pointer, and Split Pointer
+	size_t	bs;		// Byte-wise block size of pa->pb
+
+	maxstack = _stack + (sizeof(_stack) / sizeof(*_stack));
+
+	// For whoever calls us, check if we need to do anything at all
+	if (!is_lt(pb, pb - es))
+		goto deposition_pop;
+
+deposition_again:
+	// If our stack is about to over-flow, move to use the slower, but more
+	// resilient, algorithm that handles degenerate scenarios without issue
+	// If the stack is large enough, this should almost never ever happen
+	if (unlikely(stack == maxstack)) {
+		split_merge_in_place(pa, pb, pe, COMMON_ARGS);
+		goto deposition_pop;
+	}
+
+	bs = pb - pa;
+
+	// Just insert merge single items. We already know that *PB < *PA
+	if (bs == es) {
+		do {
+			swap(pa, pb);
+			pa = pb;
+			pb += es;
+		} while (pb != pe && is_lt(pb, pa));
+		goto deposition_pop;
+	} else if ((pb + es) == pe) {
+		do {
+			swap(pb, pb - es);
+			pb -= es;
+		} while ((pb != pa) && is_lt(pb, pb - es));
+		goto deposition_pop;
+	}
+
+	// Insertion MIP is slightly faster for very small sorted array pairs
+	if ((pe - pa) < (es << 3)) {
+		insertion_merge_in_place(pa, pb, pe, COMMON_ARGS);
+		goto deposition_pop;
+	}
+
+	// Shift entirety of PA->PB up as far as we can
+	for (rp = pb + bs; rp <= pe && is_lt(rp - es, pa); rp += bs) {
+		if (bs >= SWAP_BLOCK_MIN) {
+			swap_blk(pa, pb, bs);
+			pa = pb;
+			pb = rp;
+		} else {
+			for ( ; pb != rp; pa += es, pb += es)
+				swap (pa, pb);
+		}
+	}
+
+	// We couldn't shift the full PA->PB block up any further
+	// Split the block up, and keep trying with the remainders
+
+	// Handle scenario where our block cannot fit within what remains
+	// This occurs about 3% of the time, hence the use of unlikely
+	if (unlikely(rp > pe)) {
+		if (pb == pe)
+			goto deposition_pop;
+		// Adjust the block size to account for the end limit
+		bs = pe - pb;
+	}
+
+	// Find spot within PA->PB to split it at.  This means finding
+	// the first point in PB->PE that is smaller than the matching
+	// point within PA->PB, centered around the PB pivot
+	if (bs > (es << 3)) {	// Binary search on larger sets
+		size_t	min = 0, max = bs / es;
+		size_t	sn = max >> 1;
+
+		sp = pb - (sn * es);
+		rp = pb + (sn * es);
+
+		while (min < max) {
+			if (is_lt(rp, sp - es))
+				min = sn + 1;
+			else
+				max = sn;
+
+			sn = (min + max) >> 1;
+			sp = pb - (sn * es);
+			rp = pb + (sn * es);
+		}
+	} else {	// Linear scan is faster for smaller sets
+		sp = pb - bs;	rp = pb + bs;
+		for ( ; (sp != pb) && !is_lt(rp - es, sp); sp += es, rp -= es);
+	}
+
+	if (!(bs = pb - sp))	  // Determine the byte-wise size of the split
+		goto deposition_pop;  // If nothing to swap, we're done here
+
+	// Do a single deposition at the split point
+	if (bs >= SWAP_BLOCK_MIN) {
+		swap_blk(sp, pb, bs);
+	} else {
+		for (char *ta = sp, *tb = pb; ta != pb; ta += es, tb += es)
+			swap(ta, tb);
+	}
+
+	// PB->RP is the top part of A that was split, and  RP->PE is the rest
+	// of the array we're merging into.
+
+	// PA->SP is the part we left behind, and SP->PB is the part of the target
+	// array that was swapped in at the split point. PB forms a hard upper
+	// limit on the search space for this merge, so it's used as the new PE
+
+	// Oddly enough, the following line helps compiler optimization on gcc
+	bs = ((rp != pe) && is_lt(rp, rp - es));
+	if (is_lt(sp, sp - es)) {
+		if (bs)
+			DEPOSIT_STACK_PUSH(pb, rp, pe);
+		pe = pb;
+		pb = sp;
+		goto deposition_again;
+	} else if (bs) {
+		pa = pb;
+		pb = rp;
+		goto deposition_again;
+	}
+
+deposition_pop:
+	while (stack != _stack) {
+		DEPOSIT_STACK_POP(pa, pb, pe);
+		if (is_lt(pb, pb - es))
+			goto deposition_again;
+	}
+#undef	DEPOSIT_STACK_PUSH
+#undef	DEPOSIT_STACK_POP
+} // deposition_merge_in_place
+#endif
+
+
+#if LOW_STACK
+// Classic bottom-up merge sort
+static void
+simple_sort(char *pa, const size_t n, COMMON_PARAMS)
+{
+	// Handle small array size inputs with insertion sort
+	if (n < (INSERT_SORT_MAX * 2))
+		return insertion_sort(pa, n, COMMON_ARGS);
+
+	char	*pe = pa + (n * es);
+
+	do {
+		size_t	bound = n - (n % INSERT_SORT_MAX);
+		char	*bpe = pa + (bound * es);
+
+		// First just do insert sorts on all with size INSERT_SORT_MAX
+		for (char *pos = pa; pos != bpe; pos += (es * INSERT_SORT_MAX)) {
+			char	*stop = pos + (es * INSERT_SORT_MAX);
+			for (char *ta = pos + es, *tb; ta != stop; ta += es)
+				for (tb = ta; tb != pos && is_lt(tb, tb - es); tb -= es)
+					swap(tb, tb - es);
+		}
+
+		// Insert sort any remainder
+		if (n - bound)
+			insertion_sort(bpe, n - bound, COMMON_ARGS);
+	} while (0);
+
+	for (size_t size = INSERT_SORT_MAX; size < n; size += size) {
+		char	*stop = pa + ((n - size) * es);
+		for (char *pos1 = pa; pos1 < stop; pos1 += (size * es * 2)) {
+			char *pos2 = pos1 + (size * es);
+			char *pos3 = pos1 + (size * es * 2);
+
+			if (pos3 > pe)
+				pos3 = pe;
+
+			if (pos2 < pe)
+				split_merge_in_place(pos1, pos2, pos3, COMMON_ARGS);
+		}
+	}
+} // simple_sort
+
+#else
+
+// Top-down merge sort with a bias to smaller left-side arrays as this appears
+// to help the in-place merge algorithm a little bit,  This makes it a hair
+// faster than the bottom-up merge version of simple_sort().  simple_sort()  is
+// slow (about half the speed of merge_sort_in_place) but when combined with
+// either deposition_merge or split_merge, it is actually sort-stable, and the
+// stable_sort() function uses this to help find a set of unique items.
+static void
+simple_sort(char *pa, const size_t n, COMMON_PARAMS)
+{
+	// Handle small array size inputs with insertion sort
+	// Ensure there's no way na and nb could be zero
+	if ((n <= INSERT_SORT_MAX) || (n <= SKEW))
+		return insertion_sort(pa, n, COMMON_ARGS);
+
+	size_t	na = n / SKEW;
+	size_t	nb = n - na;
+	char	*pb = pa + na * es;
+	char	*pe = pa + (n * es);
+
+	simple_sort(pa, na, COMMON_ARGS);
+	simple_sort(pb, nb, COMMON_ARGS);
+
+	deposition_merge_in_place(pa, pb, pe, COMMON_ARGS);
+} // simple_sort
+#endif
+
+
+// Merges A and B together using workspace W
+// Assumes both NA and NB are > zero on entry
+// Requires workspace to be at least as large as A
+static void
+merge_using_workspace(char *a, const size_t na, char *b, const size_t nb,
+			  char *w, const size_t nw, COMMON_PARAMS)
+{
+	// Check if we need to do anything at all!
+	if (!is_lt(b, b - es))
+		return;
+
+	// Skip initial part of A if opportunity presents
+	for ( ; (a != b) && !is_lt(b, a); a += es);
+
+	if (a == b)	// Nothing to merge
+		return;
+
+	char	*e = b + (nb * es);
+	char	*pw = w;
+
+	// Now copy everything remaining from A to W
+	if ((b - a) < SWAP_BLOCK_MIN) {
+		for (char *ta = a; ta != b; pw += es, ta += es)
+			swap(pw, ta);
+	} else {
+		// Use bulk swaps for greater speed when we can
+		swap_blk(a, w, (b - a));
+		pw += (b - a);
+	}
+
+	// We already know that the first B is smaller
+	swap(a, b);
+	a += es;
+	b += es;
+
+	// Now merge rest of W into B
+	for ( ; (b != e) && (w != pw); a += es)
+		if(is_lt(b, w)) {
+			swap(a, b);
+			b += es;
+		} else {
+			swap(a, w);
+			w += es;
+		}
+
+	// Swap back any remainder
+	if (pw > w) {
+		if ((pw - w) >= SWAP_BLOCK_MIN) {
+			swap_blk(a, w, (pw - w));
+		} else {
+			for ( ; w != pw; w += es, a += es)
+				swap(a, w);
+		}
+	}
+} // merge_using_workspace
+
+
+// Base merge-sort algorithm - I'm all 'bout that speed baby!
+// It logically follows that if this is given unique items to sort
+// then the result will naturally yield a sort-stable result
+static void
+merge_sort_in_place(char * const pa, const size_t n, char * const ws,
+	      const size_t nw, COMMON_PARAMS)
+{
+	// Handle small array size inputs with insertion sort
+	if ((n <= INSERT_SORT_MAX) || (n < 8))
+		return insertion_sort(pa, n, COMMON_ARGS);
+
+	if (ws) {
+		// The DepositionSort Algorithm works best when rippling in arrays
+		// that are roughly 1/4 the size of the target array.
+		// The ratio is controlled by the SKEW #define
+		size_t	na = (n / (SKEW));
+
+		// Enforce a sensible minimum
+		if (na < 4)
+			na = 4;
+
+		// Make sure we don't exceed the given available workspace
+		if (na > nw)
+			na = nw;
+
+		size_t	nb = n - na;
+		char	*pb = pa + (na * es);
+
+		// First sort A
+		merge_sort_in_place(pa, na, ws, nw, COMMON_ARGS);
+
+		// Now sort B
+		merge_sort_in_place(pb, nb, ws, nw, COMMON_ARGS);
+
+		// Now merge A with B
+		merge_using_workspace(pa, na, pb, nb, ws, nw, COMMON_ARGS);
+	} else {
+		// 9 appears to be close to optimal, but anything from 3-20 works
+		size_t	na = n / WSRATIO;
+
+		// Enforce a sensible minimum
+		if (na < 4)
+			na = 4;
+
+		char	*pe = pa + (n * es);
+		char	*pb = pa + (na * es);
+		size_t	nb = n - na;
+
+		// Sort B using A as the workspace
+		merge_sort_in_place(pb, nb, pa, na, COMMON_ARGS);
+
+		// Now recursively sort what we used as work-space
+		merge_sort_in_place(pa, na, NULL, 0, COMMON_ARGS);
+
+		// Now merge them together
+#if LOW_STACK
+		split_merge_in_place(pa, pb, pe, COMMON_ARGS);
+#else
+		deposition_merge_in_place(pa, pb, pe, COMMON_ARGS);
+#endif
+	}
+} // merge_sort_in_place
+
+
+// Designed for efficiently processing smallish sets of items
+// Note that the last item is always assumed to be unique
+//
+// Returns a pointer to the list of unique items positioned
+// to the right-side of the array.  All duplicates are located
+// at the start (left-side) of the array (A)
+//  A -> PU = Duplicates
+// PU -> PE = Unique items
+static char *
+extract_unique_sub(char * const a, char * const pe, char *ph, COMMON_PARAMS)
+{
+	char	*pu = a;	// Points to list of unique items
+
+	// Sanitize our hints pointer
+	if (ph == NULL)
+		ph = pe;
+
+	// Process everything up to the hints pointer
+	for (char *pa = a + es; pa < ph; pa += es) {
+		if (is_lt(pa - es, pa))
+			continue;
+
+		// The item before our position is a duplicate
+		// Mark it, and then find the end of the run
+		char *dp = pa - es;
+
+		// Now find the end of the run of duplicates
+		for (pa += es; (pa < ph) && !is_lt(pa - es, pa); pa += es);
+		pa -= es;
+
+		// pa now points at the last item of the duplicate run
+		// Roll the duplicates down
+		if ((pa - dp) > es) {
+			// Multiple duplicates. swab them down
+			if (dp > pu)
+				_swab(pu, dp, pa, COMMON_ARGS);
+			pu += (pa - dp);
+		} else {
+			// Single item, just bubble it down
+			while (dp > pu) {
+				swap(dp, dp - es);
+				dp -= es;
+			}
+			pu += es;
+		}
+		pa += es;
+	}
+
+	if (ph < pe) {
+		// Everything (ph - es) to (pe - es) is a duplicate
+		_swab(pu, ph - es, pe - es, COMMON_ARGS);
+		pu += (pe - ph);
+	}
+
+	return pu;
+} // extract_unique_sub
+
+
+// Returns a pointer to the list of unique items positioned
+// to the right-side of the array.  All duplicates are located
+// at the start (left-side) of the array (A)
+//  A -> PU = Duplicates
+// PU -> PE = Unique items
+//
+// Assumptions:
+// - The list we're passed is already sorted
+static char *
+extract_uniques(char * const a, const size_t n, char *hints, COMMON_PARAMS)
+{
+	char	*pe = a + (n * es);
+
+	// I'm not sure what a good value should be here, but 40 seems okay
+	if (n < 40)
+		return extract_unique_sub(a, pe, hints, COMMON_ARGS);
+
+	if (hints == NULL)
+		hints = pe;
+
+	// Divide and conquer!  This algorithm appears to operate in close
+	// to an O(n) time complexity, albeit with a moderately high K factor
+	char	*pa = a;
+	size_t	na = (n + 3) >> 2;	// Looks to be about right
+	char	*pb = pa + (na * es);
+
+	char	*ps = pb;	// Records original intended split point
+
+	// First find where to split at, which basically means, find the
+	// end of any duplicate run that we may find ourselves in
+	while ((pb < pe) && !is_lt(pb - es, pb))
+		pb += es;
+
+	// If we couldn't find a sub-split, just process what we have
+	if (pb == pe)
+		return extract_unique_sub(a, pe, ps, COMMON_ARGS);
+
+	// Recalculate our size
+	na = (pb - pa) / es;
+	size_t	nb = n - na;
+
+	if (hints < pb)
+		hints = pe;
+
+	// Note that there is ALWAYS at least one unique to be found
+	char	*apu = extract_uniques(pa, na, ps, COMMON_ARGS);
+	char	*bpu = extract_uniques(pb, nb, hints, COMMON_ARGS);
+
+	// Coalesce non-uniques together
+	if (bpu > pb) {
+		_swab(apu, pb, bpu, COMMON_ARGS);
+	}
+	pb = apu + (bpu - pb);
+
+	// PA->BP now contains non-uniques and BP->PE are uniques
+	return pb;
+} // extract_uniques
+
+
+// This essentially operates as a "front end" to the main deposition-merge-sort
+// sequence.  Its primary role is to extract unique values from the main
+// data set, which in turn allows us to use these as a workspace to pass
+// to the main algorithm.  Doing so preserves sort stability.  While it is
+// generating the set of uniques, it is also still sorting by generating a
+// sorted set of duplicates that were disqualified, and this allows it to
+// try extra hard to find a working set as doing so isn't "time wasted".
+static void
+stable_sort(char * const pa, const size_t n, COMMON_PARAMS)
+{
+	size_t	na, nr, nw;
+	char	*ws, *pr;
+
+	// 40 items appears to be the cross-over
+	if (n <= 40)
+		return simple_sort(pa, n, COMMON_ARGS);
+
+	// We start with a workspace candidate size that is 1.1x whatever
+	// the STABLE_WSRATIO is asking for.  This allows for up to a 10%
+	// duplicate ratio on the first attempt before we try harder
+
+	na = ((n * 10) / 9) / STABLE_WSRATIO;
+	nr = n - na;
+	pr = pa + (na * es);	// Pointer to rest
+
+	// Determine how much workspace we're aiming for
+	size_t	wstarget = nr / STABLE_WSRATIO;
+
+	// First sort our candidate work-space chunk
+	simple_sort(pa, na, COMMON_ARGS);
+
+	ws = extract_uniques(pa, na, NULL, COMMON_ARGS);
+	nw = (pr - ws) / es;
+	na = na - nw;
+
+	// PA->WS is pointing at (sorted) non-uniques
+	// WS->PR is a set of uniques we can use as workspace
+	// PR->PE is everything else that we still need to sort
+
+	// If we couldn't find enough work-space we'll try up to num_tries
+	// more.  Despite this seeming excessive, with each try we're still
+	// sorting more of the array any way, so it sort of balances out.
+	// It works out that we give up at above a 99.4% duplicate rate
+	for (int tries = WSTRIES; (tries > 0) && (nw < wstarget); tries--) {
+		char	*nws = pr;
+		size_t	nna = nw * 8;	// This 8 is experimentally derived
+#if 0
+		printf("Not enough workspace. Wanted: %ld  Got: %ld  "
+		       "Duplicates: %ld\n", wstarget, nw, (ws - pa) / es);
+#endif
+		// Use whatever workspace we have so far to try to find more
+		if (nna > (nr / 4))
+			nna = nr / 4;
+
+		nr -= nna;
+		pr = pr + (nna * es);
+
+		// Sort new work-space candidate with our current workspace
+		merge_sort_in_place(nws, nna, ws, nw, COMMON_ARGS);
+
+		// Our current work-space is now jumbled, so sort that too
+		merge_sort_in_place(ws, nw, NULL, 0, COMMON_ARGS);
+#if LOW_STACK
+		// Merge current workspace with the new set
+		split_merge_in_place(ws, nws, pr, COMMON_ARGS);
+
+		// We may have picked up new duplicates.  Separate them out
+		nws = extract_uniques(ws, nw + nna, NULL, COMMON_ARGS);
+
+		// Merge original duplicates with new ones.  We're essentially
+		// sorting the array by extracting duplicates!
+		if ((nws > ws) && (ws > pa))
+			split_merge_in_place(pa, ws, nws, COMMON_ARGS);
+#else
+		// Merge current workspace with the new set
+		deposition_merge_in_place(ws, nws, pr, COMMON_ARGS);
+
+		// We may have picked up new duplicates.  Separate them out
+		nws = extract_uniques(ws, nw + nna, NULL, COMMON_ARGS);
+
+		// Merge original duplicates with new ones.  We're essentially
+		// sorting the array by extracting duplicates!
+		if ((nws > ws) && (ws > pa))
+			deposition_merge_in_place(pa, ws, nws, COMMON_ARGS);
+#endif
+		ws = nws;
+		nw = (pr - ws) / es;
+		wstarget = nr / STABLE_WSRATIO;
+	}
+
+	if (nw < wstarget) {
+		// Give up and fall back to good old simple_sort().  If the
+		// input data is that degenerate, simple_sort is fast anyway
+//		printf("We gave up! Falling back ti simple_sort\n");
+		simple_sort(pr, nr, COMMON_ARGS);
+	} else {
+		// Sort the remainder using the workspace we extracted
+		merge_sort_in_place(pr, nr, ws, nw, COMMON_ARGS);
+
+		// Now re-sort our work-space.  The result will be
+		// sort stable because we're sorting all uniques
+		merge_sort_in_place(ws, nw, NULL, 0, COMMON_ARGS);
+	}
+
+	char	*pe = pa + (n * es);
+
+#if LOW_STACK
+	if (na > nw) {
+		// Merge our work-space with the rest
+		split_merge_in_place(ws, pr, pe, COMMON_ARGS);
+
+		// Merge our non-uniques with the rest
+		if (na > 0)
+			split_merge_in_place(pa, ws, pe, COMMON_ARGS);
+	} else {
+		// Merge our non-uniques with our workspace
+		if (na > 0)
+			split_merge_in_place(pa, ws, pr, COMMON_ARGS);
+
+		// Now merge the lot together
+		split_merge_in_place(pa, pr, pe, COMMON_ARGS);
+	}
+#else
+	if (na > nw) {
+		// Merge our work-space with the rest
+		deposition_merge_in_place(ws, pr, pe, COMMON_ARGS);
+
+		// Merge our non-uniques with the rest
+		if (na > 0)
+			deposition_merge_in_place(pa, ws, pe, COMMON_ARGS);
+	} else {
+		// Merge our non-uniques with our workspace
+		if (na > 0)
+			deposition_merge_in_place(pa, ws, pr, COMMON_ARGS);
+
+		// Now merge the lot together
+		deposition_merge_in_place(pa, pr, pe, COMMON_ARGS);
+	}
+#endif
+} // stable_sort
+
+
+void
+deposition_simple(char *a, const size_t n, const size_t es,
+	const int (*is_lt)(const void *, const void *))
+{
+	int	swaptype = get_swap_type(a, es);
+
+	simple_sort(a, n, COMMON_ARGS);
+} // deposition_simple
+
+
+void
+deposition_stable(char *a, const size_t n, const size_t es,
+	const int (*is_lt)(const void *, const void *))
+{
+	int	swaptype = get_swap_type(a, es);
+
+	stable_sort(a, n, COMMON_ARGS);
+} // deposition_simple
+
+
+void
+deposition_inplace(char *a, const size_t n, const size_t es,
+	const int (*is_lt)(const void *, const void *),
+	char *workspace, size_t worksize)
+{
+	int	swaptype = get_swap_type(a, es);
+
+	merge_sort_in_place(a, n, workspace, worksize / es, COMMON_ARGS);
+} // deposition_sort
