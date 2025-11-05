@@ -495,12 +495,10 @@ deposition_again:
 		pb = rp;
 		goto deposition_again;
 	}
-
 deposition_pop:
 	while (stack != _stack) {
 		DEPOSIT_STACK_POP(pa, pb, pe);
-		if (is_lt(pb, pb - es))
-			goto deposition_again;
+		goto deposition_again;
 	}
 #undef	DEPOSIT_STACK_PUSH
 #undef	DEPOSIT_STACK_POP
